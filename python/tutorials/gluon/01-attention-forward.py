@@ -961,7 +961,7 @@ BATCH = [4]
 N_HEADS = [32]
 HEAD_DIM = [64, 128]
 causal = [False, True]
-providers = ["triton-fp16", "triton-bf16", "triton-fp8", "cudnn-fp16", "cudnn-bf16"]
+providers = ["triton-fp16", "triton-fp8"]
 N_CTX = [2**i for i in range(10, 17)]
 
 bench_configs = []
