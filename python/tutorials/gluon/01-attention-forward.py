@@ -565,7 +565,7 @@ def _borrow_s_for_epilogue(config, s_tmem):
 
 @gluon.jit
 def _attn_fwd_load(config, chnls, descs, M, STAGE: gl.constexpr):
-    pl.enter_scope("attn_fwd_load")
+    # pl.enter_scope("attn_fwd_load")
 
     q_chnl, kv_chnl, o_chnl, epi_chnl, s0_chnl, s1_chnl, c0_chnl, c1_chnl, exp_turnstile = chnls
     desc_q, desc_k, desc_v, desc_o = descs
@@ -575,47 +575,46 @@ def _attn_fwd_load(config, chnls, descs, M, STAGE: gl.constexpr):
 
     scheduler = ProgramScheduler.create(config)
     for pid in range(scheduler.start_pid, scheduler.num_tiles, config.NUM_SMS):
-        pl.enter_scope("load_outer_iter")
+        # pl.enter_scope("load_outer_iter")
 
         prog = scheduler.get_program(pid)
         lo, hi = prog.get_fused_loop_bounds(STAGE)
 
         q0_offset = prog.qo_offset_y + config.SPLIT_M * 0
-        with pl.scope("q0 acquire"):
-            q0_smem, q0_bar, q_producer = q_producer.acquire()
+        # with pl.scope("q0 acquire"):
+        q0_smem, q0_bar, q_producer = q_producer.acquire()
         issue_async_tma_load(q0_smem, q0_bar, desc_q, q0_offset)
 
         offsetkv_y = prog.offset_y + lo
-        with pl.scope("k0 acquire"):
-            k_smem, k_bar, kv_producer = kv_producer.acquire()
+        # with pl.scope("k0 acquire"):
+        k_smem, k_bar, kv_producer = kv_producer.acquire()
         issue_async_tma_load(k_smem, k_bar, desc_k, offsetkv_y)
 
         q1_offset = prog.qo_offset_y + config.SPLIT_M * 1
-        with pl.scope("q1 acquire"):
-            q1_smem, q1_bar, q_producer = q_producer.acquire()
+        # with pl.scope("q1 acquire"):
+        q1_smem, q1_bar, q_producer = q_producer.acquire()
         issue_async_tma_load(q1_smem, q1_bar, desc_q, q1_offset)
 
-        with pl.scope("v0 acquire"):
-            v_smem, v_bar, kv_producer = kv_producer.acquire()
+        # with pl.scope("v0 acquire"):
+        v_smem, v_bar, kv_producer = kv_producer.acquire()
         issue_async_tma_load(v_smem, v_bar, desc_v, offsetkv_y)
 
         for start_n in range(lo + config.BLOCK_N, hi, config.BLOCK_N):
             offsetkv_y = prog.offset_y + start_n
-            with pl.scope("ki acquire"):
-                k_smem, k_bar, kv_producer = kv_producer.acquire()
+            # with pl.scope("ki acquire"):
+            k_smem, k_bar, kv_producer = kv_producer.acquire()
             issue_async_tma_load(k_smem, k_bar, desc_k, offsetkv_y)
-            with pl.scope("vi acquire"):
-                v_smem, v_bar, kv_producer = kv_producer.acquire()
+            # with pl.scope("vi acquire"):
+            v_smem, v_bar, kv_producer = kv_producer.acquire()
             issue_async_tma_load(v_smem, v_bar, desc_v, offsetkv_y)
 
-        pl.exit_scope("load_outer_iter")
-
-    pl.exit_scope("attn_fwd_load")
+        # pl.exit_scope("load_outer_iter")
+    # pl.exit_scope("attn_fwd_load")
 
 
 @gluon.jit
 def _attn_fwd_mma(config, chnls, descs, M, STAGE: gl.constexpr):
-    pl.enter_scope("attn_fwd_mma")
+    # pl.enter_scope("attn_fwd_mma")
 
     q_chnl, kv_chnl, o_chnl, epi_chnl, s0_chnl, s1_chnl, c0_chnl, c1_chnl, exp_turnstile = chnls
     desc_q, desc_k, desc_v, desc_o = descs
@@ -695,7 +694,7 @@ def _attn_fwd_mma(config, chnls, descs, M, STAGE: gl.constexpr):
         tcgen05_mma(p1_tmem, v_smem, o1_tmem, use_acc=o_init, mbarriers=[o1_bar, v_bar, s0_bar, s1_bar])
         pl.exit_scope("mma_outer_iter")
 
-    pl.exit_scope("attn_fwd_mma")
+    # pl.exit_scope("attn_fwd_mma")
 
 
 @gluon.jit
@@ -728,30 +727,36 @@ def _softmax_inner_loop(tile_id: gl.constexpr, config, prog,  #
         alpha_tmem.store(gl.convert_layout(alpha.expand_dims(1), config.alpha_2d_layout))
         mbarrier.arrive(corr_bar, count=1)
 
-        if config.HEAD_DIM == 64:
-            _, exp_bar, exp_turnstile = exp_turnstile.acquire()
-
         pl.enter_scope("compute_qk")
+        # FIXME: No idea why using FFMA is slower.
         # qk = _fma_f32x2(qk, gl.full_like(qk, config.qk_scale), -m_ij[:, None])
         qk = _mul_f32x2(qk, gl.full_like(qk, config.qk_scale))
         qk = _add_f32x2(qk, -m_ij[:, None])
         qk0, qk1, = qk.reshape([config.SPLIT_M, 2, config.BLOCK_N // 2]).permute(0, 2, 1).split()
         pl.exit_scope("compute_qk")
 
-        if config.HEAD_DIM == 64:
-            qk00, qk01 = qk0.reshape([config.SPLIT_M, 2, config.BLOCK_N // 4]).permute(0, 2, 1).split()
-            qk10, qk11 = qk1.reshape([config.SPLIT_M, 2, config.BLOCK_N // 4]).permute(0, 2, 1).split()
-
         p_tmem = _borrow_s_as_p(config, s_tmem)
         BN4: gl.constexpr = config.BLOCK_N // 4
         BN2: gl.constexpr = config.BLOCK_N // 2
 
-        pl.enter_scope("p0")
+        # Force the softmax partitions to take turns in the EX2 section. This
+        # prevents contention for the EX2 unit and improves utilization.
         if config.HEAD_DIM == 64:
+            with pl.scope("exp_turnstile acquire"):
+                _, exp_bar, exp_turnstile = exp_turnstile.acquire()
+
+        pl.enter_scope("p0")
+        # FIXME: When using FADD2 reductions, ptxas misbehaves and spills far
+        # below the register limit in the FADD2, FMUL2, EX2 section. Subtile by
+        # 4 to minimize the spilling.
+        if config.HEAD_DIM == 64:
+            qk00, qk01 = qk0.reshape([config.SPLIT_M, 2, config.BLOCK_N // 4]).permute(0, 2, 1).split()
             p00 = gl.exp2(qk00)
             p_tmem.slice(0, BN4).store(p00.to(config.dtype))
             p01 = gl.exp2(qk01)
             p_tmem.slice(BN4, BN4).store(p01.to(config.dtype))
+            p0 = gl.join(p00, p01).permute(0, 2, 1).reshape([config.SPLIT_M, config.BLOCK_N // 2])
+            p0 = gl.convert_layout(p0, config.qk_layout)
         else:
             p0 = gl.exp2(qk0)
             p_tmem.slice(0, BN2).store(p0.to(config.dtype))
@@ -759,10 +764,13 @@ def _softmax_inner_loop(tile_id: gl.constexpr, config, prog,  #
 
         pl.enter_scope("p1")
         if config.HEAD_DIM == 64:
+            qk10, qk11 = qk1.reshape([config.SPLIT_M, 2, config.BLOCK_N // 4]).permute(0, 2, 1).split()
             p10 = gl.exp2(qk10)
             p_tmem.slice(2 * BN4, BN4).store(p10.to(config.dtype))
             p11 = gl.exp2(qk11)
             p_tmem.slice(3 * BN4, BN4).store(p11.to(config.dtype))
+            p1 = gl.join(p10, p11).permute(0, 2, 1).reshape([config.SPLIT_M, config.BLOCK_N // 2])
+            p1 = gl.convert_layout(p1, config.qk_layout)
         else:
             p1 = gl.exp2(qk1)
             p_tmem.slice(BN2, BN2).store(p1.to(config.dtype))
@@ -777,12 +785,7 @@ def _softmax_inner_loop(tile_id: gl.constexpr, config, prog,  #
             mbarrier.arrive(exp_bar, count=1)
 
         pl.enter_scope("l_i")
-
         if config.HEAD_DIM == 64:
-            p0 = gl.join(p00, p01).permute(0, 2, 1).reshape([config.SPLIT_M, config.BLOCK_N // 2])
-            p1 = gl.join(p10, p11).permute(0, 2, 1).reshape([config.SPLIT_M, config.BLOCK_N // 2])
-            p0 = gl.convert_layout(p0, config.qk_layout)
-            p1 = gl.convert_layout(p1, config.qk_layout)
             l_ij0, l_ij1 = gl.reduce((p0, p1), axis=1, combine_fn=_reduce_fadd2)
         else:
             p = gl.join(p0, p1).permute(0, 2, 1).reshape([config.SPLIT_M, config.BLOCK_N])
@@ -790,6 +793,8 @@ def _softmax_inner_loop(tile_id: gl.constexpr, config, prog,  #
             l_ij = gl.sum(p, axis=1)
 
         if config.HEAD_DIM == 64:
+            # This is a difference of 1 SASS instruction but it dramatically
+            # affects instruction scheduling.
             if config.dtype.primitive_bitwidth == 8:
                 l_i0, l_i1 = _pairwise_fma_f32x2(l_i0, alpha, l_ij0, l_i1, alpha, l_ij1)
             else:
@@ -797,9 +802,9 @@ def _softmax_inner_loop(tile_id: gl.constexpr, config, prog,  #
                 l_i1 = l_i1 * alpha + l_ij1
         else:
             l_i0 = l_i0 * alpha + l_ij
+        pl.exit_scope("l_i")
 
         m_i = m_ij
-        pl.exit_scope("l_i")
 
         pl.exit_scope("softmax_inner_iter")
 
@@ -829,6 +834,7 @@ def _softmax_tile(tile_id: gl.constexpr, config, M, desc_o, STAGE: gl.constexpr,
 
         m_i = gl.full([config.SPLIT_M], -float("inf"), gl.float32, qk_slice_dim1)
         l_i0 = gl.full([config.SPLIT_M], 0.0, gl.float32, qk_slice_dim1)
+        # Accumulate into 2 row-sums so the reduction can be performed with FADD2.
         if config.HEAD_DIM == 64:
             l_i1 = gl.full([config.SPLIT_M], 0.0, gl.float32, qk_slice_dim1)
         else:
@@ -842,6 +848,7 @@ def _softmax_tile(tile_id: gl.constexpr, config, M, desc_o, STAGE: gl.constexpr,
             m_i, l_i0, l_i1, corr_bar, s_consumer, corr_producer, exp_turnstile = _softmax_inner_loop(  #
                 tile_id, config, prog, s_consumer, corr_producer, exp_turnstile, corr_bar,  #
                 offs_m, offs_n, m_i, l_i0, l_i1, STAGE=2)
+
         if config.HEAD_DIM == 64:
             l_i = l_i0 + l_i1
         else:
@@ -1188,7 +1195,7 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype, profile=False):
 
 BATCH = [4]
 N_HEADS = [32]
-HEAD_DIM = [64, 128]
+HEAD_DIM = [64]
 causal = [False, True]
 providers = ["triton-fp16", "triton-fp8"]
 N_CTX = [2**i for i in range(10, 17)]
@@ -1250,5 +1257,5 @@ def bench(Z, H, N_CTX, HEAD_DIM, causal, provider):
 
 
 if __name__ == "__main__":
-    bench.run(save_path=".", print_data=True)
-    # test_op(Z=1, H=2, N_CTX=8192, HEAD_DIM=64, causal=False, dtype=torch.float16, profile=False)
+    # bench.run(save_path=".", print_data=True)
+    test_op(Z=4, H=32, N_CTX=16 * 1024, HEAD_DIM=64, causal=False, dtype=torch.float16, profile=False)
