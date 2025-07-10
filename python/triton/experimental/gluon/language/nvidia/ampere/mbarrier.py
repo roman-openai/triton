@@ -1,3 +1,4 @@
+from triton._C.libtriton import ir
 from triton.experimental.gluon.language._layouts import SwizzledSharedLayout
 from triton.experimental.gluon.language._core import builtin, _unwrap_if_constexpr
 
@@ -50,7 +51,7 @@ def invalidate(mbarrier, _semantic=None):
 
 
 @builtin
-def wait(mbarrier, phase, pred=True, deps=(), _semantic=None):
+def wait(mbarrier, phase, pred=None, deps=(), _semantic=None):
     """
     Wait until the mbarrier object completes its current phase.
 
@@ -61,13 +62,12 @@ def wait(mbarrier, phase, pred=True, deps=(), _semantic=None):
         deps (Sequence[shared_memory_descriptor]): Dependent allocations barrier is waiting on. Used to track liveness of dependent allocations. Defaults to ().
     """
     phase = _semantic.to_tensor(phase)
-    pred = _semantic.to_tensor(pred)
-    deps = [x.handle for x in deps]
-    _semantic.builder.create_mbarrier_wait(mbarrier.handle, phase.handle, pred.handle, deps)
+    pred_handle = ir.value() if pred is None else _semantic.to_tensor(pred).handle
+    _semantic.builder.create_mbarrier_wait(mbarrier.handle, phase.handle, pred_handle, deps)
 
 
 @builtin
-def arrive(mbarrier, *, pred=True, _semantic=None):
+def arrive(mbarrier, *, pred=None, _semantic=None):
     """
     Arrive on an mbarrier, signaling that a thread has reached the barrier.
 
@@ -76,5 +76,5 @@ def arrive(mbarrier, *, pred=True, _semantic=None):
         pred (bool): Predicate. Operation is skipped if predicate is False. Defaults to True.
     """
     count = 1
-    pred = _semantic.to_tensor(pred)
-    _semantic.builder.create_mbarrier_arrive(mbarrier.handle, count, pred.handle)
+    pred_handle = ir.value() if pred is None else _semantic.to_tensor(pred).handle
+    _semantic.builder.create_mbarrier_arrive(mbarrier.handle, count, pred_handle)
