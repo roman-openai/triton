@@ -134,7 +134,7 @@ static LogicalResult findTrivialSubcomputation(LLVM::LLVMFuncOp func,
     Operation *op = capture.getDefiningOp();
     // Check if the defining op can be rematerialized. At the LLVM level,
     // checking for pure is probably a good enough heuristic.
-    if (isPure(op)) {
+    if (isPure(op) || mlir::hasSingleEffect<MemoryEffects::Read>(op)) {
       ops.insert(op);
       worklist.insert(op->operand_begin(), op->operand_end());
       continue;
@@ -214,7 +214,7 @@ static LogicalResult rewriteWarpGroupBarriers(LLVM::LLVMFuncOp func,
 
     if (auto bar = dyn_cast<NVVM::Barrier0Op>(op)) {
       TritonLLVMIRRewriter b(bar.getLoc(), bar);
-      createBarrier(b, /*barIdx=*/0, defaultWarpGroupSize, /*aligned=*/true);
+      b.create<NVVM::BarrierOp>(b.i32_val(0), b.i32_val(defaultWarpGroupSize));
       bar.erase();
       return WalkResult::skip();
     }
@@ -234,7 +234,7 @@ static LogicalResult rewriteWarpGroupBarriers(LLVM::LLVMFuncOp func,
       unsigned warpGroupSize = threadsPerWarp * op.getPartitionNumWarps()[idx];
       partition->walk([&](NVVM::Barrier0Op bar) {
         TritonLLVMIRRewriter b(bar.getLoc(), bar);
-        createBarrier(b, barIdx, warpGroupSize, /*aligned=*/true);
+        b.create<NVVM::BarrierOp>(b.i32_val(barIdx), b.i32_val(warpGroupSize));
         bar.erase();
       });
     }
@@ -544,6 +544,96 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
 }
 
 //===----------------------------------------------------------------------===//
+//
+//===----------------------------------------------------------------------===//
+
+static LogicalResult
+lowerWarpSpecializeOptimized(LLVM::LLVMFuncOp func,
+                             const NVIDIA::TargetInfo &targetInfo) {
+  SmallVector<WarpSpecializeOp> wsOps;
+  func.walk([&](WarpSpecializeOp op) { wsOps.push_back(op); });
+  if (wsOps.size() != 1)
+    return func.emitError("more than one wsOp");
+  WarpSpecializeOp wsOp = wsOps.front();
+  if (!wsOp->getBlock()->isEntryBlock())
+    return func.emitError("not in the entry block");
+  for (Value capture : wsOp.getExplicitCaptures()) {
+    SetVector<Operation *> ops;
+    if (failed(findTrivialSubcomputation(func, capture, ops)))
+      return func.emitError("failed to find trivial subcomputation");
+  }
+  int numWarps = lookupNumWarps(func);
+  if (failed(rewriteWarpGroupBarriers(func, wsOps, 32, numWarps * 32)))
+    llvm::report_fatal_error("unexpected barrier rewrite failure");
+  elideTrivialCaptures(func, wsOps);
+
+  TritonLLVMIRRewriter b(wsOp.getLoc(), wsOp);
+  Block *header = wsOp->getBlock();
+  Block *body = b.splitBlock(header, header->begin());
+  Block *after = b.splitBlock(body, std::next(wsOp->getIterator()));
+
+  b.setInsertionPointAfter(wsOp);
+  createAllBarrier(b, kSwitchLoopBarrierIdx);
+  b.create<LLVM::BrOp>(&wsOp.getDefaultRegion().front());
+
+  wsOp.getDefaultRegion().walk([&](WarpYieldOp op) {
+    TritonLLVMIRRewriter b(op.getLoc(), op);
+    b.create<LLVM::BrOp>(op.getOperands(), after);
+    op.erase();
+  });
+  for (Value result : wsOp.getResults()) {
+    Value arg = after->addArgument(result.getType(), wsOp.getLoc());
+    result.replaceAllUsesWith(arg);
+  }
+
+  SmallVector<Block *> partitionBlocks{body};
+  for (Region *region : wsOp.getPartitionRegions()) {
+    partitionBlocks.push_back(&region->front());
+    b.setInsertionPointToStart(partitionBlocks.back());
+    createAllBarrier(b, kSwitchLoopBarrierIdx);
+    region->walk([&](WarpReturnOp op) {
+      TritonLLVMIRRewriter b(op.getLoc(), op);
+      b.create<LLVM::ReturnOp>(ValueRange());
+      op.erase();
+    });
+  }
+
+  func.getBlocks().splice(after->getIterator(),
+                          wsOp.getDefaultRegion().getBlocks());
+  for (Region *region : wsOp.getPartitionRegions()) {
+    func.getBlocks().splice(func.getBlocks().end(), region->getBlocks());
+  }
+
+  b.setInsertionPointToStart(header);
+  Value tid = b.create<NVVM::ThreadIdXOp>(b.getIntegerType(32));
+  Value wid = b.udiv(tid, b.i32_val(32));
+  wid = targetInfo.shuffleIdx(b, b.getLoc(), wid, 0);
+
+  for (auto [i, start] : llvm::enumerate(*wsOp.getWarpGroupStartIds())) {
+    header = new Block;
+    func.getBlocks().insert(body->getIterator(), header);
+    Value cond = b.icmp_ult(wid, b.i32_val(start));
+    b.create<LLVM::CondBrOp>(cond, partitionBlocks[i], header);
+    b.setInsertionPointToEnd(header);
+  }
+  b.create<LLVM::BrOp>(partitionBlocks.back());
+
+  auto maxnreg = func->getParentOfType<ModuleOp>()->getAttrOfType<IntegerAttr>(
+      AttrMaxRegistersName);
+  if (wsOp.getActualRegisters() && maxnreg) {
+    assert(partitionBlocks.size() == wsOp.getActualRegistersAttr().size());
+    for (auto [block, actRegs] :
+         llvm::zip(partitionBlocks, *wsOp.getActualRegisters())) {
+      b.setInsertionPointToStart(block);
+      createRegRealloc(b, maxnreg.getInt(), actRegs);
+    }
+  }
+
+  wsOp.erase();
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // Pass Definition
 //===----------------------------------------------------------------------===//
 
@@ -572,12 +662,16 @@ struct ConvertWarpSpecializeToLLVM
 
     SmallVector<LLVM::LLVMFuncOp> kernels;
     for (auto func : mod.getOps<LLVM::LLVMFuncOp>()) {
-      if (func.isPublic())
+      if (func.isPublic() && !func.getBody().empty())
         kernels.push_back(func);
     }
-    for (LLVM::LLVMFuncOp kernel : kernels)
-      if (failed(lowerWarpSpecialize(kernel, targetInfo)))
+    for (LLVM::LLVMFuncOp kernel : kernels) {
+      if (failed(lowerWarpSpecializeOptimized(kernel, targetInfo)))
         return signalPassFailure();
+    }
+
+    // if (failed(lowerWarpSpecialize(kernel, targetInfo)))
+    //   return signalPassFailure();
   }
 };
 } // namespace
